@@ -19,3 +19,9 @@ class AppConfig:
     yolo_conf: float = 0.35
     item_link_iou: float = 0.02
     item_link_dist: float = 160.0
+    
+    # logging
+    logs_csv: str = "logs/detections.csv"
+    detection_images_dir: str = "logs/detection_images"
+    station: str = "first_class_cabin"
+    dedupe_cooldown_seconds: int = 30
