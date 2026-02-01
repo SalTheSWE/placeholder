@@ -1,133 +1,289 @@
-# streamlit_app.py
-# Pure Streamlit interface skeleton (no processing logic)
-
+import os
+import time
+import cv2
+import numpy as np
+import pandas as pd
 import streamlit as st
-import os 
+from insightface.app import FaceAnalysis
+
+# -----------------------------
+# Paths
+# -----------------------------
+VIDEO_PATH = "resources/input_video/IMG_3433.mp4"
+USERS_CSV = "resources/csvs/firstclass_users.csv"
+FACES_DIR = "resources/faces"
+
+# -----------------------------
+# Fixed parameters
+# -----------------------------
+RESIZE_WIDTH = 640
+SIM_THRESHOLD = 0.45
+FRAME_DELAY = 0.01
+DETECT_INTERVAL = 15
+
+# -----------------------------
+# Face model
+# -----------------------------
+@st.cache_resource
+def get_face_app():
+    app = FaceAnalysis(name="buffalo_s")
+    app.prepare(ctx_id=-1, det_size=(320, 320))
+    return app
+
+
+# -----------------------------
+# Embedding helpers
+# -----------------------------
+def normalize(vec):
+    return vec / (np.linalg.norm(vec) + 1e-9)
+
+
+def first_face_embedding(face_app, img_bgr):
+    if img_bgr is None:
+        return None
+
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    faces = face_app.get(img_rgb)
+    if not faces:
+        return None
+
+    faces = sorted(
+        faces,
+        key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]),
+        reverse=True,
+    )
+
+    return normalize(faces[0].embedding)
+
+
+# -----------------------------
+# Gallery builder
+# -----------------------------
+@st.cache_data
+def build_gallery(csv_path, faces_dir):
+    df = pd.read_csv(csv_path)
+
+    required_cols = {"user_id", "image", "name"}
+    if not required_cols.issubset(df.columns):
+        raise ValueError("CSV must contain: user_id,image,name")
+
+    face_app = get_face_app()
+
+    gallery = []
+
+    for _, row in df.iterrows():
+        path = os.path.join(faces_dir, row["image"])
+        img = cv2.imread(path)
+
+        if img is None:
+            print("Image missing:", path)
+            continue
+
+        emb = first_face_embedding(face_app, img)
+
+        if emb is None:
+            print("No face detected:", path)
+            continue
+
+        gallery.append(
+            {
+                "user_id": str(row["user_id"]),
+                "name": str(row["name"]),
+                "image_path": path,
+                "embedding": emb,
+            }
+        )
+
+    if not gallery:
+        return [], None, None
+
+    mat = np.stack([g["embedding"] for g in gallery]).astype(np.float32)
+    ids = [g["user_id"] for g in gallery]
+
+    return gallery, mat, ids
+
+
+# -----------------------------
+# Drawing helper
+# -----------------------------
+def draw_box(frame, bbox, text, color):
+    x1, y1, x2, y2 = map(int, bbox)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    cv2.putText(
+        frame,
+        text,
+        (x1, max(0, y1 - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
+# -----------------------------
+# UI Setup
+# -----------------------------
 st.set_page_config(page_title="First Class Cabin Monitor", layout="wide")
 st.title("First Class Cabin Monitor")
-st.markdown("""
-<style>
-.live-feed video {
-    width: 100%;
-    max-width: 100px;   /* change this */
-}
-</style>
-""", unsafe_allow_html=True)
-VIDEO_PATH = "resources/input_video/IMG_3433.MOV"
-# ---------------------------
-# Tabs
-# ---------------------------
-tab_live, tab_users, tab_db = st.tabs(
-    ["Live Monitor", "First Class Users", "Search Database"]
-)
 
-# ===========================
-# TAB 1 — LIVE MONITOR
-# ===========================
-with tab_live:
-    # Outer layout
-    col_feed_area, col_controls, col_alerts = st.columns([3, 1, 1])
+for p in [VIDEO_PATH, USERS_CSV, FACES_DIR]:
+    if not os.path.exists(p):
+        st.error(f"Missing path: {p}")
+        st.stop()
 
-    # ---- Live Feed ----
-    with col_feed_area:
-        st.subheader("Live Feed")
+gallery, gallery_mat, gallery_ids = build_gallery(USERS_CSV, FACES_DIR)
 
-        # Inner layout to control video width
-        video_col, spacer_col = st.columns([1, 2])  # <-- video takes 1/3 of feed area
+tab_live, tab_users = st.tabs(["Live Monitor", "First Class Users"])
 
-        with video_col:
-            if os.path.exists(VIDEO_PATH):
-                st.video(VIDEO_PATH)
-            else:
-                st.info("Video file not found.")
-
-
-    # ---- CSV output ----
-    st.subheader("Flagged events (CSV sent to employees)")
-    st.info("Flagged event table will appear here.")
-    table_placeholder = st.empty()
-
-    st.download_button(
-        "Download flagged events CSV",
-        data=b"",
-        file_name="flagged_events.csv",
-        mime="text/csv",
-    )
-
-# ===========================
-# TAB 2 — FIRST CLASS USERS
-# ===========================
+# -----------------------------
+# Users tab
+# -----------------------------
 with tab_users:
+    st.subheader("First Class Users")
 
-    st.subheader("First Class Passenger List")
-    st.info("First class passenger CSV table will appear here.")
+    rows = [
+        {
+            "user_id": g["user_id"],
+            "name": g["name"],
+            "embedding_loaded": g["embedding"] is not None,
+        }
+        for g in gallery
+    ]
 
-    users_table_placeholder = st.empty()
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-    st.markdown("### Passenger Image Viewer")
+    if gallery:
+        options = [f'{g["user_id"]} - {g["name"]}' for g in gallery]
+        sel = st.selectbox("Select passenger", options)
 
-    col_select, col_action = st.columns([3, 1])
+        if st.button("Show Image"):
+            uid = sel.split(" - ")[0]
+            entry = next(x for x in gallery if x["user_id"] == uid)
+            st.image(entry["image_path"], width=300)
 
-    with col_select:
-        user_selector = st.selectbox(
-            "Select passenger",
-            options=["Passenger list will load here"],
-        )
 
-    with col_action:
-        show_image_btn = st.button("Show Image")
+# -----------------------------
+# Live Monitor
+# -----------------------------
+with tab_live:
+    col_feed, col_controls, col_status = st.columns([3, 1, 1])
 
-    st.info("Passenger image will appear here.")
-    user_image_placeholder = st.empty()
+    with col_feed:
+        st.subheader("Live Feed")
+        feed_ph = st.empty()
 
-    st.download_button(
-        "Download passenger CSV",
-        data=b"",
-        file_name="first_class_passengers.csv",
-        mime="text/csv",
-    )
+    with col_controls:
+        st.subheader("Controls")
+        start = st.button("Start live feed")
+        stop = st.button("Stop live feed")
 
-# ===========================
-# TAB 3 — SEARCH DATABASE
-# ===========================
-with tab_db:
+    with col_status:
+        status_ph = st.empty()
+        stats_ph = st.empty()
 
-    st.subheader("Search Database")
-    st.info("Search database records using a query.")
+    if "running" not in st.session_state:
+        st.session_state.running = False
 
-    col_query, col_action = st.columns([4, 1])
+    if start:
+        st.session_state.running = True
+    if stop:
+        st.session_state.running = False
 
-    with col_query:
-        query_input = st.text_input(
-            "Enter search query",
-            placeholder="Example: passenger_id=1234 OR identity='John Doe'",
-        )
+    if st.session_state.running:
+        face_app = get_face_app()
+        cap = cv2.VideoCapture(VIDEO_PATH)
 
-    with col_action:
-        search_btn = st.button("Search")
+        if not cap.isOpened():
+            st.error("Could not open video.")
+            st.stop()
 
-    st.markdown("### Search Results")
-    st.info("Query results will appear here.")
-    db_results_placeholder = st.empty()
+        status_ph.write("Running")
 
-    st.download_button(
-        "Download search results",
-        data=b"",
-        file_name="search_results.csv",
-        mime="text/csv",
-    )
+        frame_i = 0
+        trackers = []
+        tracker_ids = []
 
-# ---------------------------
-# Button feedback (UI only)
-# ---------------------------
-if 'start_btn' in locals() and start_btn:
-    st.success("Live feed started (interface only).")
+        try:
+            while st.session_state.running:
+                ok, frame = cap.read()
+                if not ok:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
 
-if 'stop_btn' in locals() and stop_btn:
-    st.warning("Live feed stopped.")
+                frame_i += 1
 
-if 'search_btn' in locals() and search_btn:
-    st.success("Search executed (interface only).")
+                h, w = frame.shape[:2]
+                if w != RESIZE_WIDTH:
+                    nh = int(h * RESIZE_WIDTH / w)
+                    frame = cv2.resize(frame, (RESIZE_WIDTH, nh))
 
-if 'show_image_btn' in locals() and show_image_btn:
-    st.success("Passenger image requested (interface only).")
+                matches = 0
+
+                # Detection step
+                if frame_i % DETECT_INTERVAL == 0 or not trackers:
+                    trackers.clear()
+                    tracker_ids.clear()
+
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    faces = face_app.get(rgb)
+
+                    for f in faces:
+                        emb = normalize(f.embedding)
+
+                        if gallery_mat is not None:
+                            sims = gallery_mat @ emb
+                            idx = int(np.argmax(sims))
+                            sim = float(sims[idx])
+                        else:
+                            idx, sim = -1, -1
+
+                        identity = (
+                            gallery_ids[idx]
+                            if idx >= 0 and sim >= SIM_THRESHOLD
+                            else "no id"
+                        )
+
+                        if identity != "no id":
+                            matches += 1
+
+                        x1, y1, x2, y2 = map(int, f.bbox)
+                        tracker = cv2.TrackerCSRT_create()
+                        tracker.init(frame, (x1, y1, x2 - x1, y2 - y1))
+
+                        trackers.append(tracker)
+                        tracker_ids.append(identity)
+
+                # Tracking step
+                for tracker, identity in zip(trackers, tracker_ids):
+                    ok, box = tracker.update(frame)
+                    if not ok:
+                        continue
+
+                    x, y, wbox, hbox = map(int, box)
+                    color = (0, 255, 0) if identity != "no id" else (0, 0, 255)
+
+                    draw_box(
+                        frame,
+                        (x, y, x + wbox, y + hbox),
+                        f"identity: {identity}",
+                        color,
+                    )
+
+                feed_ph.image(
+                    cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                    channels="RGB",
+                    use_container_width=True,
+                )
+
+                stats_ph.write(
+                    f"Frame {frame_i} | Trackers {len(trackers)} | Matches {matches}"
+                )
+
+                time.sleep(FRAME_DELAY)
+
+        finally:
+            cap.release()
+
+    else:
+        status_ph.write("Stopped")
