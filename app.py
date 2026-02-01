@@ -1,171 +1,58 @@
 import os
 import time
 import cv2
-import numpy as np
-import pandas as pd
 import streamlit as st
-from insightface.app import FaceAnalysis
 
-# -----------------------------
-# Paths
-# -----------------------------
-VIDEO_PATH = "resources/input_video/IMG_3433.mp4"
-USERS_CSV = "resources/csvs/firstclass_users.csv"
-FACES_DIR = "resources/faces"
+from core.config import AppConfig
+from core.face_engine import create_face_app, faces_in_frame, normalize
+from core.gallery import build_gallery
+from core.yolo_engine import create_yolo, detect_people_food_drink
+from core.trackers import create_tracker
+from core.assoc import best_person_for_face, item_near_person
 
-# -----------------------------
-# Fixed parameters
-# -----------------------------
-RESIZE_WIDTH = 640
-SIM_THRESHOLD = 0.45
-FRAME_DELAY = 0.01
-DETECT_INTERVAL = 15
+CFG = AppConfig()
 
-# -----------------------------
-# Face model
-# -----------------------------
-@st.cache_resource
-def get_face_app():
-    app = FaceAnalysis(name="buffalo_s")
-    app.prepare(ctx_id=-1, det_size=(320, 320))
-    return app
-
-
-# -----------------------------
-# Embedding helpers
-# -----------------------------
-def normalize(vec):
-    return vec / (np.linalg.norm(vec) + 1e-9)
-
-
-def first_face_embedding(face_app, img_bgr):
-    if img_bgr is None:
-        return None
-
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    faces = face_app.get(img_rgb)
-    if not faces:
-        return None
-
-    faces = sorted(
-        faces,
-        key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]),
-        reverse=True,
-    )
-
-    return normalize(faces[0].embedding)
-
-
-# -----------------------------
-# Gallery builder
-# -----------------------------
-@st.cache_data
-def build_gallery(csv_path, faces_dir):
-    df = pd.read_csv(csv_path)
-
-    required_cols = {"user_id", "image", "name"}
-    if not required_cols.issubset(df.columns):
-        raise ValueError("CSV must contain: user_id,image,name")
-
-    face_app = get_face_app()
-
-    gallery = []
-
-    for _, row in df.iterrows():
-        path = os.path.join(faces_dir, row["image"])
-        img = cv2.imread(path)
-
-        if img is None:
-            print("Image missing:", path)
-            continue
-
-        emb = first_face_embedding(face_app, img)
-
-        if emb is None:
-            print("No face detected:", path)
-            continue
-
-        gallery.append(
-            {
-                "user_id": str(row["user_id"]),
-                "name": str(row["name"]),
-                "image_path": path,
-                "embedding": emb,
-            }
-        )
-
-    if not gallery:
-        return [], None, None
-
-    mat = np.stack([g["embedding"] for g in gallery]).astype(np.float32)
-    ids = [g["user_id"] for g in gallery]
-
-    return gallery, mat, ids
-
-
-# -----------------------------
-# Drawing helper
-# -----------------------------
-def draw_box(frame, bbox, text, color):
+def draw_box(frame, bbox, lines, color):
     x1, y1, x2, y2 = map(int, bbox)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    cv2.putText(
-        frame,
-        text,
-        (x1, max(0, y1 - 8)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        color,
-        2,
-        cv2.LINE_AA,
-    )
+    y = max(0, y1 - 10)
+    for line in lines:
+        cv2.putText(frame, line, (x1, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+        y -= 18
 
-
-# -----------------------------
-# UI Setup
-# -----------------------------
 st.set_page_config(page_title="First Class Cabin Monitor", layout="wide")
 st.title("First Class Cabin Monitor")
 
-for p in [VIDEO_PATH, USERS_CSV, FACES_DIR]:
+for p in [CFG.video_path, CFG.users_csv, CFG.faces_dir]:
     if not os.path.exists(p):
         st.error(f"Missing path: {p}")
         st.stop()
 
-gallery, gallery_mat, gallery_ids = build_gallery(USERS_CSV, FACES_DIR)
+# Load engines
+face_app = create_face_app()
+yolo = create_yolo(CFG.yolo_model)
+
+# Build gallery
+gallery, gallery_mat, gallery_ids, gallery_names = build_gallery(face_app, CFG.users_csv, CFG.faces_dir)
 
 tab_live, tab_users = st.tabs(["Live Monitor", "First Class Users"])
 
-# -----------------------------
-# Users tab
-# -----------------------------
 with tab_users:
     st.subheader("First Class Users")
+    st.dataframe(
+        [
+            {
+                "user_id": g["user_id"],
+                "name": g["name"],
+                "image": os.path.basename(g["image_path"]),
+                "embedding_ok": g["embedding"] is not None,
+                "error": g["error"],
+            }
+            for g in gallery
+        ],
+        use_container_width=True
+    )
 
-    rows = [
-        {
-            "user_id": g["user_id"],
-            "name": g["name"],
-            "embedding_loaded": g["embedding"] is not None,
-        }
-        for g in gallery
-    ]
-
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
-
-    if gallery:
-        options = [f'{g["user_id"]} - {g["name"]}' for g in gallery]
-        sel = st.selectbox("Select passenger", options)
-
-        if st.button("Show Image"):
-            uid = sel.split(" - ")[0]
-            entry = next(x for x in gallery if x["user_id"] == uid)
-            st.image(entry["image_path"], width=300)
-
-
-# -----------------------------
-# Live Monitor
-# -----------------------------
 with tab_live:
     col_feed, col_controls, col_status = st.columns([3, 1, 1])
 
@@ -190,100 +77,94 @@ with tab_live:
     if stop:
         st.session_state.running = False
 
-    if st.session_state.running:
-        face_app = get_face_app()
-        cap = cv2.VideoCapture(VIDEO_PATH)
-
-        if not cap.isOpened():
-            st.error("Could not open video.")
-            st.stop()
-
-        status_ph.write("Running")
-
-        frame_i = 0
-        trackers = []
-        tracker_ids = []
-
-        try:
-            while st.session_state.running:
-                ok, frame = cap.read()
-                if not ok:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
-
-                frame_i += 1
-
-                h, w = frame.shape[:2]
-                if w != RESIZE_WIDTH:
-                    nh = int(h * RESIZE_WIDTH / w)
-                    frame = cv2.resize(frame, (RESIZE_WIDTH, nh))
-
-                matches = 0
-
-                # Detection step
-                if frame_i % DETECT_INTERVAL == 0 or not trackers:
-                    trackers.clear()
-                    tracker_ids.clear()
-
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    faces = face_app.get(rgb)
-
-                    for f in faces:
-                        emb = normalize(f.embedding)
-
-                        if gallery_mat is not None:
-                            sims = gallery_mat @ emb
-                            idx = int(np.argmax(sims))
-                            sim = float(sims[idx])
-                        else:
-                            idx, sim = -1, -1
-
-                        identity = (
-                            gallery_ids[idx]
-                            if idx >= 0 and sim >= SIM_THRESHOLD
-                            else "no id"
-                        )
-
-                        if identity != "no id":
-                            matches += 1
-
-                        x1, y1, x2, y2 = map(int, f.bbox)
-                        tracker = cv2.TrackerCSRT_create()
-                        tracker.init(frame, (x1, y1, x2 - x1, y2 - y1))
-
-                        trackers.append(tracker)
-                        tracker_ids.append(identity)
-
-                # Tracking step
-                for tracker, identity in zip(trackers, tracker_ids):
-                    ok, box = tracker.update(frame)
-                    if not ok:
-                        continue
-
-                    x, y, wbox, hbox = map(int, box)
-                    color = (0, 255, 0) if identity != "no id" else (0, 0, 255)
-
-                    draw_box(
-                        frame,
-                        (x, y, x + wbox, y + hbox),
-                        f"identity: {identity}",
-                        color,
-                    )
-
-                feed_ph.image(
-                    cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                    channels="RGB",
-                    use_container_width=True,
-                )
-
-                stats_ph.write(
-                    f"Frame {frame_i} | Trackers {len(trackers)} | Matches {matches}"
-                )
-
-                time.sleep(FRAME_DELAY)
-
-        finally:
-            cap.release()
-
-    else:
+    if not st.session_state.running:
         status_ph.write("Stopped")
+        st.stop()
+
+    status_ph.write("Running")
+
+    cap = cv2.VideoCapture(CFG.video_path)
+    if not cap.isOpened():
+        st.error("Could not open video.")
+        st.stop()
+
+    frame_i = 0
+    trackers = []
+    track_meta = []  # {"identity","has_food","has_drink"}
+
+    while st.session_state.running:
+        ok, frame = cap.read()
+        if not ok:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+
+        frame_i += 1
+
+        # resize
+        h, w = frame.shape[:2]
+        if w != CFG.resize_width:
+            nh = int(h * CFG.resize_width / w)
+            frame = cv2.resize(frame, (CFG.resize_width, nh), interpolation=cv2.INTER_AREA)
+
+        # detect every N frames (re-init trackers + meta)
+        if frame_i % CFG.detect_interval == 0 or not trackers:
+            trackers.clear()
+            track_meta.clear()
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            persons, foods, drinks = detect_people_food_drink(yolo, rgb, CFG.yolo_conf)
+            faces = faces_in_frame(face_app, frame)
+
+            for f in faces:
+                face_box = tuple(map(int, f.bbox.tolist()))
+                person_box = best_person_for_face(face_box, persons) or face_box
+
+                emb = normalize(f.embedding)
+
+                identity = "no id"
+                if gallery_mat is not None:
+                    sims = gallery_mat @ emb
+                    idx = int(sims.argmax())
+                    if float(sims[idx]) >= CFG.sim_threshold:
+                        identity = gallery_ids[idx]
+
+                has_food = any(item_near_person(b, person_box, CFG.item_link_iou, CFG.item_link_dist) for b in foods)
+                has_drink = any(item_near_person(b, person_box, CFG.item_link_iou, CFG.item_link_dist) for b in drinks)
+
+                x1, y1, x2, y2 = person_box
+                tracker = create_tracker()
+                tracker.init(frame, (x1, y1, x2 - x1, y2 - y1))
+
+                trackers.append(tracker)
+                track_meta.append({"identity": identity, "has_food": has_food, "has_drink": has_drink})
+
+        # update trackers and draw
+        for trk, meta in zip(trackers, track_meta):
+            ok, box = trk.update(frame)
+            if not ok:
+                continue
+            x, y, bw, bh = map(int, box)
+            bbox = (x, y, x + bw, y + bh)
+
+            identity = meta["identity"]
+            color = (0, 255, 0) if identity != "no id" else (0, 0, 255)
+
+            draw_box(
+                frame,
+                bbox,
+                [
+                    f"identity: {identity}",
+                    f"has food: {'yes' if meta['has_food'] else 'no'}",
+                    f"has drink: {'yes' if meta['has_drink'] else 'no'}",
+                ],
+                color
+            )
+
+        feed_ph.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+        stats_ph.write(f"Frame {frame_i} | Trackers {len(trackers)}")
+
+        time.sleep(CFG.frame_delay)
+
+    cap.release()
